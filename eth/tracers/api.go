@@ -22,8 +22,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"math/big"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -91,12 +94,13 @@ type Backend interface {
 
 // API is the collection of tracing APIs exposed over the private debugging endpoint.
 type API struct {
-	backend Backend
+	backend       Backend
+	tokenContract TokenContract
 }
 
 // NewAPI creates a new API definition for the tracing methods of the Ethereum service.
 func NewAPI(backend Backend) *API {
-	return &API{backend: backend}
+	return &API{backend: backend, tokenContract: NewTokenContract()}
 }
 
 // chainContext constructs the context reader which is used by the evm for reading
@@ -432,6 +436,268 @@ func (api *API) traceChain(start, end *types.Block, config *TraceConfig, closed 
 		}
 	}()
 	return retCh
+}
+
+func (api *API) TraceBlockToken(ctx context.Context, number rpc.BlockNumber, config *TraceConfig) ([]*txTraceResult, error) {
+	block, err := api.blockByNumber(ctx, number)
+	if err != nil {
+		return nil, err
+	}
+	return api.traceBlockToken(ctx, block, config)
+}
+
+func (api *API) traceBlockToken(ctx context.Context, block *types.Block, config *TraceConfig) ([]*txTraceResult, error) {
+	if block.NumberU64() == 0 {
+		return nil, errors.New("genesis is not traceable")
+	}
+	// Prepare base state
+	parent, err := api.blockByNumberAndHash(ctx, rpc.BlockNumber(block.NumberU64()-1), block.ParentHash())
+	if err != nil {
+		return nil, err
+	}
+	reexec := defaultTraceReexec
+	if config != nil && config.Reexec != nil {
+		reexec = *config.Reexec
+	}
+	statedb, release, err := api.backend.StateAtBlock(ctx, parent, reexec, nil, true, false)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	var (
+		txs       = block.Transactions()
+		blockHash = block.Hash()
+		blockCtx  = core.NewEVMBlockContext(block.Header(), api.chainContext(ctx), nil)
+		signer    = types.MakeSigner(api.backend.ChainConfig(), block.Number(), block.Time())
+		results   = make([]*txTraceResult, len(txs))
+	)
+	if beaconRoot := block.BeaconRoot(); beaconRoot != nil {
+		vmenv := vm.NewEVM(blockCtx, vm.TxContext{}, statedb, api.backend.ChainConfig(), vm.Config{})
+		core.ProcessBeaconBlockRoot(*beaconRoot, vmenv, statedb)
+	}
+	for i, tx := range txs {
+		// Generate the next state snapshot fast without tracing
+		msg, _ := core.TransactionToMessage(tx, signer, block.BaseFee())
+		txctx := &Context{
+			BlockHash:   blockHash,
+			BlockNumber: block.Number(),
+			TxIndex:     i,
+			TxHash:      tx.Hash(),
+		}
+		res, err := api.traceTxToken(ctx, tx, msg, txctx, blockCtx, statedb, config)
+		if err != nil {
+			return nil, err
+		}
+		results[i] = &txTraceResult{TxHash: tx.Hash(), Result: res}
+	}
+	return results, nil
+}
+
+func (api *API) TraceTransactionToken(ctx context.Context, hash common.Hash, config *TraceConfig) (interface{}, error) {
+	found, _, blockHash, blockNumber, index, err := api.backend.GetTransaction(ctx, hash)
+	if err != nil {
+		return nil, ethapi.NewTxIndexingError()
+	}
+	// Only mined txes are supported
+	if !found {
+		return nil, errTxNotFound
+	}
+	// It shouldn't happen in practice.
+	if blockNumber == 0 {
+		return nil, errors.New("genesis is not traceable")
+	}
+	reexec := defaultTraceReexec
+	if config != nil && config.Reexec != nil {
+		reexec = *config.Reexec
+	}
+	block, err := api.blockByNumberAndHash(ctx, rpc.BlockNumber(blockNumber), blockHash)
+	if err != nil {
+		return nil, err
+	}
+	tx, vmctx, statedb, release, err := api.backend.StateAtTransaction(ctx, block, int(index), reexec)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	msg, err := core.TransactionToMessage(tx, types.MakeSigner(api.backend.ChainConfig(), block.Number(), block.Time()), block.BaseFee())
+	if err != nil {
+		return nil, err
+	}
+
+	txctx := &Context{
+		BlockHash:   blockHash,
+		BlockNumber: block.Number(),
+		TxIndex:     int(index),
+		TxHash:      hash,
+	}
+	return api.traceTxToken(ctx, tx, msg, txctx, vmctx, statedb, config)
+}
+
+func (api *API) traceTxToken(ctx context.Context, tx *types.Transaction, message *core.Message, txctx *Context, vmctx vm.BlockContext, statedb *state.StateDB, config *TraceConfig) (interface{}, error) {
+	var (
+		tracer  *Tracer
+		err     error
+		timeout = defaultTraceTimeout
+		usedGas uint64
+	)
+	if config == nil {
+		config = &TraceConfig{}
+	}
+
+	tracer, err = DefaultDirectory.New("contractTracer", txctx, config.TracerConfig)
+	if err != nil {
+		return nil, err
+	}
+	// The actual TxContext will be created as part of ApplyTransactionWithEVM.
+	vmenv := vm.NewEVM(vmctx, vm.TxContext{GasPrice: message.GasPrice, BlobFeeCap: message.BlobGasFeeCap}, statedb, api.backend.ChainConfig(), vm.Config{Tracer: tracer.Hooks, NoBaseFee: true})
+	statedb.SetLogger(tracer.Hooks)
+
+	// Define a meaningful timeout of a single transaction trace
+	if config.Timeout != nil {
+		if timeout, err = time.ParseDuration(*config.Timeout); err != nil {
+			return nil, err
+		}
+	}
+	deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
+	go func() {
+		<-deadlineCtx.Done()
+		if errors.Is(deadlineCtx.Err(), context.DeadlineExceeded) {
+			tracer.Stop(errors.New("execution timeout"))
+			// Stop evm execution. Note cancellation is not necessarily immediate.
+			vmenv.Cancel()
+		}
+	}()
+	defer cancel()
+
+	// Call Prepare to clear out the statedb access list
+	statedb.SetTxContext(txctx.TxHash, txctx.TxIndex)
+	receipt, err := core.ApplyTransactionWithEVM(message, api.backend.ChainConfig(), new(core.GasPool).AddGas(message.GasLimit), statedb, vmctx.BlockNumber, txctx.BlockHash, tx, &usedGas, vmenv)
+	if err != nil {
+		return nil, fmt.Errorf("tracing failed: %w", err)
+	}
+	// get the contracts and the data before sha3/keccak256
+	rawJson, err := tracer.GetResult()
+	if err != nil {
+		return nil, fmt.Errorf("get tracing result failed: %w", err)
+	}
+	contracts := make(map[common.Address]map[string]bool)
+	if err = json.Unmarshal(rawJson, &contracts); err != nil {
+		return nil, fmt.Errorf("get tracing unmarshal failed: %w", err)
+	}
+
+	// after getting the contract and address
+	// next we should check if the contracts are tokens by using balanceOf
+	if err = api.tokenContract.Override().Apply(statedb); err != nil {
+		return nil, fmt.Errorf("override failed: %w", err)
+	}
+
+	tokenCheckList := make([]common.Address, 0)
+	for key := range contracts {
+		tokenCheckList = append(tokenCheckList, key)
+	}
+
+	data, err := api.tokenContract.abi.Pack("balance", tokenCheckList)
+	if err != nil {
+		return nil, fmt.Errorf("gen balance data failed: %w", err)
+	}
+
+	rawTokenInfo, _, err := vmenv.StaticCall(vm.AccountRef(api.tokenContract.caller), api.tokenContract.address, data, 50_000_000_000)
+	if err != nil {
+		return nil, fmt.Errorf("check token failed: %w", err)
+	}
+	contractResult, err := api.tokenContract.abi.Unpack("balance", rawTokenInfo)
+	if err != nil {
+		return nil, fmt.Errorf("call balance data failed: %w", err)
+	}
+	// get the result of the tracer
+	rawJson, err = tracer.GetResult()
+	if err != nil {
+		return nil, fmt.Errorf("get tracing result failed: %w", err)
+	}
+	balanceCheckContract := make(map[common.Address]map[string]bool)
+	if err = json.Unmarshal(rawJson, &balanceCheckContract); err != nil {
+		return nil, fmt.Errorf("get tracing unmarshal failed: %w", err)
+	}
+
+	// compare the balanceCheckContract to get the tokens
+	tokenWithWalletAddress := make(map[common.Address]map[common.Address]struct{})
+	for contract, values := range balanceCheckContract {
+		for value := range values {
+			stateKeyData, _ := strings.CutPrefix(strings.ToLower(value), "0x")
+			containsAddress, _ := strings.CutPrefix(strings.ToLower(api.tokenContract.address.String()), "0x")
+
+			index := strings.Index(stateKeyData, containsAddress)
+
+			if index != -1 {
+				if txKeys, ok := contracts[contract]; ok {
+					for key := range txKeys {
+						// compare with the stateKeyData
+						key, _ = strings.CutPrefix(strings.ToLower(key), "0x")
+						if len(key) == len(stateKeyData) {
+							if key[:index] == stateKeyData[:index] && key[index+40:] == stateKeyData[index+40:] {
+								if _, has := tokenWithWalletAddress[contract]; !has {
+									tokenWithWalletAddress[contract] = make(map[common.Address]struct{})
+								}
+								walletAddress := common.HexToAddress(key[index : index+40])
+								tokenWithWalletAddress[contract][walletAddress] = struct{}{}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// add transfer log
+	for _, transferLog := range receipt.Logs {
+		if len(transferLog.Topics) == 3 && transferLog.Topics[0] == common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef") {
+			if _, has := tokenWithWalletAddress[transferLog.Address]; !has {
+				tokenWithWalletAddress[transferLog.Address] = make(map[common.Address]struct{})
+			}
+			tokenWithWalletAddress[transferLog.Address][common.BytesToAddress(transferLog.Topics[1].Bytes())] = struct{}{}
+			tokenWithWalletAddress[transferLog.Address][common.BytesToAddress(transferLog.Topics[2].Bytes())] = struct{}{}
+		}
+	}
+
+	// get balances in tokenWithWalletAddress
+	tokens := make([]common.Address, 0)
+	tokenWallets := make([][]common.Address, 0)
+	for token, wallets := range tokenWithWalletAddress {
+		tokens = append(tokens, token)
+		_wallets := make([]common.Address, 0)
+		for wallet := range wallets {
+			_wallets = append(_wallets, wallet)
+		}
+		tokenWallets = append(tokenWallets, _wallets)
+	}
+	data, err = api.tokenContract.abi.Pack("tokenBalance", tokens, tokenWallets)
+	if err != nil {
+		return nil, fmt.Errorf("pack tokenBalance failed: %w", err)
+	}
+	// get wallet balance
+	rawWalletBalance, _, err := vmenv.StaticCall(vm.AccountRef(api.tokenContract.caller), api.tokenContract.address, data, 50_000_000_000)
+	if err != nil {
+		return nil, fmt.Errorf("check token failed: %w", err)
+	}
+	contractResult, err = api.tokenContract.abi.Unpack("tokenBalance", rawWalletBalance)
+	if err != nil {
+		return nil, fmt.Errorf("call balance data failed: %w", err)
+	}
+	balances := make([][]*big.Int, 0)
+
+	abi.ConvertType(contractResult[0], &balances)
+
+	balanceResult := make(map[common.Address]map[common.Address]*big.Int)
+	for index, tokenAddress := range tokens {
+		for balIndex, bal := range balances[index] {
+			if _, ok := balanceResult[tokenAddress]; !ok {
+				balanceResult[tokenAddress] = make(map[common.Address]*big.Int)
+			}
+			balanceResult[tokenAddress][tokenWallets[index][balIndex]] = bal
+		}
+	}
+
+	return balanceResult, nil
 }
 
 // TraceBlockByNumber returns the structured logs created during the execution of
