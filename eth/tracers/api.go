@@ -642,11 +642,11 @@ func (api *API) traceTxToken(ctx context.Context, tx *types.Transaction, message
 							walletAddress := common.HexToAddress(key[index : index+40])
 
 							// check if the contract has the top contract
-							if topContract, ok := contracts.TopContracts[contract]; !ok {
+							if topContract, ok := contracts.TopContracts[contract]; ok {
 								if _, has := tokenWithWalletAddress[topContract]; !has {
 									tokenWithWalletAddress[topContract] = make(map[common.Address]struct{})
 								}
-								tokenWithWalletAddress[contract][topContract] = struct{}{}
+								tokenWithWalletAddress[topContract][walletAddress] = struct{}{}
 							}
 
 							if _, has := tokenWithWalletAddress[contract]; !has {
